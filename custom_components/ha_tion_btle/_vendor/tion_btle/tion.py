@@ -116,6 +116,14 @@ class Tion:
         self._state_cache_ttl: float = 0.0
         self._connection_lock = Semaphore(1)
         self._operation_lock = asyncio.Lock()
+        # Keep at most one SET transaction waiting behind the active BLE
+        # operation. Slider controls may submit many intermediate values while
+        # a weak connection is still busy; merge those values so the next
+        # transaction applies the latest requested state instead of replaying
+        # a stale queue for minutes.
+        self._pending_set_settings: dict = {}
+        self._pending_set_waiters: list[asyncio.Future[dict]] = []
+        self._set_worker_task: asyncio.Task[None] | None = None
 
     @abc.abstractmethod
     async def _send_request(self, request: bytearray):
@@ -249,9 +257,15 @@ class Tion:
     @final
     async def set(self, new_settings=None) -> dict:
         """
-        Set new breezer state
+        Set new breezer state, coalescing requests that have not started yet.
+
+        One BLE transaction may already be in progress. Any SET calls received
+        before it completes are merged into a single following transaction;
+        for the same field, the most recent value wins. All callers in that
+        batch receive the result of the merged transaction.
+
         :param new_settings: json with new state
-        :return: None
+        :return: confirmed breezer state
         """
         new_settings = dict(new_settings or {})
 
@@ -262,6 +276,46 @@ class Tion:
         except KeyError:
             pass
 
+        waiter = asyncio.get_running_loop().create_future()
+        self._pending_set_settings.update(new_settings)
+        self._pending_set_waiters.append(waiter)
+
+        if self._set_worker_task is None or self._set_worker_task.done():
+            self._set_worker_task = asyncio.create_task(self._drain_pending_sets())
+
+        return await waiter
+
+    async def _drain_pending_sets(self) -> None:
+        """Execute one active SET and one latest-value pending SET at a time."""
+        try:
+            while self._pending_set_waiters:
+                settings = self._pending_set_settings
+                waiters = self._pending_set_waiters
+                self._pending_set_settings = {}
+                self._pending_set_waiters = []
+
+                if len(waiters) > 1:
+                    _LOGGER.debug(
+                        "Coalesced %d pending SET requests into %s",
+                        len(waiters),
+                        settings,
+                    )
+
+                try:
+                    result = await self._set(settings)
+                except Exception as err:
+                    for waiter in waiters:
+                        if not waiter.done():
+                            waiter.set_exception(err)
+                else:
+                    for waiter in waiters:
+                        if not waiter.done():
+                            waiter.set_result(result)
+        finally:
+            self._set_worker_task = None
+
+    async def _set(self, new_settings: dict) -> dict:
+        """Execute a single SET transaction."""
         async with self._operation_lock:
             try:
                 await self.connect()
