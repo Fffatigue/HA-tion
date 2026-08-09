@@ -4,14 +4,13 @@
   "documentation": "https://github.com/TionAPI/HA-tion/wiki",
   "dependencies": [
     "bluetooth",
+    "bluetooth_adapters",
     "fan"
   ],
-  "requirements": [
-    "tion-btle==3.3.6"
-  ],
+  "requirements": [],
   "codeowners": [
     "@IATkachenko"
   ],
   "config_flow": true,
-  "version": "v4.2.0"
+  "version": "4.2.1-tionfix.1"
 }

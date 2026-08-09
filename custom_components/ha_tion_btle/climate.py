@@ -263,11 +263,6 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
         self._attr_hvac_action = HVACAction.OFF if not self.coordinator.data.get("is_on") else \
             HVACAction.HEATING if self.coordinator.data.get("is_heating") else HVACAction.FAN
 
-    @property
-    def available(self) -> bool:
-        """Return if entity is available."""
-        return True
-
     async def set_air_source(self, source: str):
         _LOGGER.debug(f"set_air_source: {source}")
         await self.coordinator.set(mode=source)

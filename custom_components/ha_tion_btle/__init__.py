@@ -1,19 +1,20 @@
 """The Tion breezer component."""
 from __future__ import annotations
 
+from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 import datetime
 import logging
 import math
-from datetime import timedelta
 from functools import cached_property
 
-import tion_btle
+from bleak_retry_connector import BleakNotFoundError, establish_connection
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothCallbackMatcher
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from tion_btle.tion import Tion, MaxTriesExceededError
+from ._vendor import tion_btle
+from ._vendor.tion_btle.tion import Tion
 from .const import DOMAIN, TION_SCHEMA, CONF_KEEP_ALIVE, CONF_AWAY_TEMP, CONF_MAC, PLATFORMS
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -64,12 +65,9 @@ class TionInstance(DataUpdateCoordinator):
         except KeyError:
             pass
 
-        # delay before next update if we got btle.BTLEDisconnectError
-        self._delay: int = 600
-
         self.__tion: Tion = self.getTion(self.model, btle_device)
+        self.__tion.set_client_factory(self._async_create_client)
         self.__keep_alive = datetime.timedelta(seconds=self.__keep_alive)
-        self._delay = datetime.timedelta(seconds=self._delay)
         self.rssi: int = 0
 
         if self._config_entry.unique_id is None:
@@ -107,30 +105,45 @@ class TionInstance(DataUpdateCoordinator):
     def _decode_state(state: str) -> bool:
         return True if state == "on" else False
 
+    def _prepare_response(self, response: dict) -> dict:
+        """Convert a tion-btle response to Home Assistant state."""
+        response = response.copy()
+        response["is_on"] = self._decode_state(response["state"])
+        response["heater"] = self._decode_state(response["heater"])
+        response["is_heating"] = self._decode_state(response["heating"])
+        response["filter_remain"] = math.ceil(response["filter_remain"])
+        response["fan_speed"] = int(response["fan_speed"])
+        response["rssi"] = self.rssi
+        return response
+
+    async def _async_create_client(self, _device: str | BLEDevice) -> BleakClient:
+        """Connect through the best adapter currently known to Home Assistant."""
+        device = bluetooth.async_ble_device_from_address(
+            self.hass,
+            self.config[CONF_MAC],
+            connectable=True,
+        )
+        if device is None:
+            raise BleakNotFoundError(
+                f"Could not find connectable Tion {self.config[CONF_MAC]}"
+            )
+        return await establish_connection(
+            BleakClient,
+            device,
+            self.name,
+            max_attempts=3,
+        )
+
     async def async_update_state(self):
         self.logger.info("Tion instance update started")
         response: dict[str, str | bool | int] = {}
 
         try:
             response = await self.__tion.get()
-            self.update_interval = self.__keep_alive
+        except Exception as err:
+            raise UpdateFailed(f"Unable to update Tion: {err}") from err
 
-        except MaxTriesExceededError as e:
-            _LOGGER.critical("Got exception %s", str(e))
-            _LOGGER.critical("Will delay next check")
-            self.update_interval = self._delay
-            raise UpdateFailed("MaxTriesExceededError")
-        except Exception as e:
-            _LOGGER.critical(f"{response=}, {e=}")
-            raise e
-
-        response["is_on"]: bool = self._decode_state(response["state"])
-        response["heater"]: bool = self._decode_state(response["heater"])
-        response["is_heating"] = self._decode_state(response["heating"])
-        response["filter_remain"] = math.ceil(response["filter_remain"])
-        response["fan_speed"] = int(response["fan_speed"])
-        response["rssi"] = self.rssi
-
+        response = self._prepare_response(response)
         self.logger.debug(f"Result is {response}")
         return response
 
@@ -143,7 +156,6 @@ class TionInstance(DataUpdateCoordinator):
         if "fan_speed" in kwargs:
             kwargs["fan_speed"] = int(kwargs["fan_speed"])
 
-        original_args = kwargs.copy()
         if "is_on" in kwargs:
             kwargs["state"] = "on" if kwargs["is_on"] else "off"
             del kwargs["is_on"]
@@ -152,18 +164,17 @@ class TionInstance(DataUpdateCoordinator):
 
         args = ', '.join('%s=%r' % x for x in kwargs.items())
         _LOGGER.info("Need to set: " + args)
-        await self.__tion.set(kwargs)
-        self.data.update(original_args)
-        self.async_update_listeners()
+        response = await self.__tion.set(kwargs)
+        self.async_set_updated_data(self._prepare_response(response))
 
     @staticmethod
     def getTion(model: str, mac: str | BLEDevice) -> tion_btle.TionS3 | tion_btle.TionLite | tion_btle.TionS4:
         if model == 'S3':
-            from tion_btle.s3 import TionS3 as Breezer
+            from ._vendor.tion_btle.s3 import TionS3 as Breezer
         elif model == 'S4':
-            from tion_btle.s4 import TionS4 as Breezer
+            from ._vendor.tion_btle.s4 import TionS4 as Breezer
         elif model == 'Lite':
-            from tion_btle.lite import TionLite as Breezer
+            from ._vendor.tion_btle.lite import TionLite as Breezer
         else:
             raise NotImplementedError("Model '%s' is not supported!" % model)
         return Breezer(mac)

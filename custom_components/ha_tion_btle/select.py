@@ -57,8 +57,3 @@ class TionInputSelect(SelectEntity, CoordinatorEntity):
         self._attr_current_option = self.coordinator.data.get(self.entity_description.key)
         self._attr_assumed_state = False if self.coordinator.last_update_success else True
         self.async_write_ha_state()
-
-    @property
-    def available(self) -> bool:
-        """Return if entity is available."""
-        return True

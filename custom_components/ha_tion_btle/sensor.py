@@ -109,8 +109,3 @@ class TionSensor(SensorEntity, CoordinatorEntity):
     def _handle_coordinator_update(self) -> None:
         self._attr_assumed_state = False if self.coordinator.last_update_success else True
         self.async_write_ha_state()
-
-    @property
-    def available(self) -> bool:
-        """Return if entity is available."""
-        return True
