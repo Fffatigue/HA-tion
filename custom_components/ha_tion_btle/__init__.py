@@ -67,6 +67,11 @@ class TionInstance(DataUpdateCoordinator):
 
         self.__tion: Tion = self.getTion(self.model, btle_device)
         self.__tion.set_client_factory(self._async_create_client)
+        # A successful coordinator refresh stores the complete state required
+        # by Tion's full-state SET command. Reuse it for up to two polling
+        # intervals so normal controls need only SET + its response; cold,
+        # stale, or uncertain state still falls back to GET + SET.
+        self.__tion.set_state_cache_ttl(max(self.__keep_alive * 2, 60))
         self.__keep_alive = datetime.timedelta(seconds=self.__keep_alive)
         self.rssi: int = 0
 

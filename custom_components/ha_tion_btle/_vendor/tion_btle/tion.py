@@ -6,7 +6,7 @@ import inspect
 import logging
 from asyncio import Semaphore
 from typing import Awaitable, Callable, List, final
-from time import localtime, strftime
+from time import localtime, monotonic, strftime
 
 from bleak import BleakClient
 from bleak import exc
@@ -108,6 +108,12 @@ class Tion:
         self.__connections_count: int = 0
         self.__notifications_enabled: bool = False
         self.have_breezer_state: bool = False
+        # ``have_breezer_state`` belongs to the response currently being
+        # collected and is intentionally reset for every connection/request.
+        # Keep the last decoded full device state separately so a SET can
+        # preserve unchanged fields without issuing a preliminary GET.
+        self._state_cache_updated_at: float | None = None
+        self._state_cache_ttl: float = 0.0
         self._connection_lock = Semaphore(1)
         self._operation_lock = asyncio.Lock()
 
@@ -199,6 +205,7 @@ class Tion:
             await self.disconnect()
 
         self._decode_response(response)
+        self._mark_state_cache_updated()
 
     @final
     async def get(self, skip_update: bool = False) -> dict:
@@ -213,9 +220,10 @@ class Tion:
 
     async def _get(self, skip_update: bool = False) -> dict:
         """Get the state while the caller holds the operation lock."""
-        if skip_update and self.have_breezer_state:
-            _LOGGER.debug(f"Skipping getting state from breezer because skip_update={skip_update} and "
-                          f"have_breezer_state={self.have_breezer_state}")
+        if skip_update and self._has_fresh_state_cache():
+            _LOGGER.debug(
+                "Skipping GET because the last confirmed full state is still fresh"
+            )
         else:
             await self.get_state_from_breezer()
         common = self.__generate_common_json()
@@ -245,8 +253,7 @@ class Tion:
         :param new_settings: json with new state
         :return: None
         """
-        if new_settings is None:
-            new_settings = {}
+        new_settings = dict(new_settings or {})
 
         try:
             if new_settings["fan_speed"] == 0:
@@ -267,9 +274,37 @@ class Tion:
                 await self._send_request(encoded_request)
                 response = await self._get_data_from_breezer()
                 self._decode_response(response)
+                self._mark_state_cache_updated()
                 return await self._get(skip_update=True)
+            except Exception:
+                # The write may have reached the breezer while its response was
+                # lost. Do not trust the old full-state cache on the next SET.
+                self._invalidate_state_cache()
+                raise
             finally:
                 await self.disconnect()
+
+    @final
+    def set_state_cache_ttl(self, seconds: float) -> None:
+        """Enable the confirmed-state fast SET path for ``seconds``."""
+        self._state_cache_ttl = max(float(seconds), 0.0)
+
+    @final
+    def _mark_state_cache_updated(self) -> None:
+        """Remember when a full state was confirmed by the breezer."""
+        self._state_cache_updated_at = monotonic()
+
+    @final
+    def _invalidate_state_cache(self) -> None:
+        """Force the next SET to refresh the full state first."""
+        self._state_cache_updated_at = None
+
+    @final
+    def _has_fresh_state_cache(self) -> bool:
+        """Return whether the cached full state is safe to reuse for SET."""
+        if self._state_cache_ttl <= 0 or self._state_cache_updated_at is None:
+            return False
+        return monotonic() - self._state_cache_updated_at <= self._state_cache_ttl
 
     @final
     @property
