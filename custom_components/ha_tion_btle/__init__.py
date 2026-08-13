@@ -7,6 +7,7 @@ import datetime
 import logging
 import math
 from functools import cached_property
+from time import monotonic
 
 from bleak_retry_connector import BleakNotFoundError, establish_connection
 from homeassistant.components import bluetooth
@@ -20,6 +21,8 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 
 _LOGGER = logging.getLogger(__name__)
+
+ALTERNATE_SOURCE_COOLDOWN_SECONDS = 60
 
 
 async def async_setup(hass, config):
@@ -67,6 +70,8 @@ class TionInstance(DataUpdateCoordinator):
 
         self.__tion: Tion = self.getTion(self.model, btle_device)
         self.__tion.set_client_factory(self._async_create_client)
+        self.__tion.set_alternate_client_factory(self._async_create_alternate_client)
+        self.__tion.set_session_failure_callback(self._handle_session_failure)
         # A successful coordinator refresh stores the complete state required
         # by Tion's full-state SET command. Reuse it for up to two polling
         # intervals so normal controls need only SET + its response; cold,
@@ -74,6 +79,9 @@ class TionInstance(DataUpdateCoordinator):
         self.__tion.set_state_cache_ttl(max(self.__keep_alive * 2, 60))
         self.__keep_alive = datetime.timedelta(seconds=self.__keep_alive)
         self.rssi: int = 0
+        self._last_connection_source: str | None = None
+        self._failed_connection_source: str | None = None
+        self._failed_connection_at: float | None = None
 
         if self._config_entry.unique_id is None:
             _LOGGER.critical(f"Unique id is None for {self._config_entry.title}! "
@@ -121,23 +129,161 @@ class TionInstance(DataUpdateCoordinator):
         response["rssi"] = self.rssi
         return response
 
-    async def _async_create_client(self, _device: str | BLEDevice) -> BleakClient:
-        """Connect through the best adapter currently known to Home Assistant."""
-        device = bluetooth.async_ble_device_from_address(
+    @staticmethod
+    def _device_source(device: BLEDevice) -> str | None:
+        """Return the Home Assistant scanner source embedded in a BLEDevice."""
+        details = getattr(device, "details", None)
+        if isinstance(details, dict):
+            source = details.get("source")
+            return str(source) if source is not None else None
+        return None
+
+    def _handle_session_failure(self, err: Exception) -> None:
+        """Temporarily deprioritize the scanner used by a failed BLE session."""
+        self._failed_connection_source = self._last_connection_source
+        self._failed_connection_at = monotonic()
+        _LOGGER.debug(
+            "BLE session for %s failed through source %s: %s",
+            self.name,
+            self._failed_connection_source or "unknown",
+            err,
+        )
+
+    def _connection_candidates(self) -> list[tuple[BLEDevice, str | None, int]]:
+        """Return one current connectable BLEDevice per scanner, best RSSI first."""
+        address = self.config[CONF_MAC]
+        by_source: dict[str, tuple[BLEDevice, str | None, int]] = {}
+        preferred_device = bluetooth.async_ble_device_from_address(
             self.hass,
-            self.config[CONF_MAC],
+            address,
             connectable=True,
         )
-        if device is None:
+        preferred_source = (
+            self._device_source(preferred_device)
+            if preferred_device is not None
+            else None
+        )
+
+        try:
+            scanner_devices = bluetooth.async_scanner_devices_by_address(
+                self.hass,
+                address,
+                connectable=True,
+            )
+        except (AttributeError, TypeError):
+            scanner_devices = []
+
+        for scanner_device in scanner_devices:
+            device = scanner_device.ble_device
+            source = getattr(scanner_device.scanner, "source", None)
+            source = str(source) if source is not None else self._device_source(device)
+            advertisement = scanner_device.advertisement
+            rssi = int(getattr(advertisement, "rssi", -127))
+            key = source or repr(getattr(device, "details", None))
+            current = by_source.get(key)
+            if current is None or rssi > current[2]:
+                by_source[key] = (device, source, rssi)
+
+            if (
+                preferred_source is None
+                and preferred_device is not None
+                and (
+                    device is preferred_device
+                    or getattr(device, "details", None)
+                    == getattr(preferred_device, "details", None)
+                )
+            ):
+                preferred_source = source
+
+        if not by_source:
+            if preferred_device is not None:
+                by_source[
+                    preferred_source
+                    or repr(getattr(preferred_device, "details", None))
+                ] = (
+                    preferred_device,
+                    preferred_source,
+                    self.rssi,
+                )
+
+        return sorted(
+            by_source.values(),
+            key=lambda candidate: (
+                candidate[1] == preferred_source,
+                candidate[2],
+            ),
+            reverse=True,
+        )
+
+    async def _async_connect_candidate(
+        self,
+        device: BLEDevice,
+        source: str | None,
+        rssi: int,
+        route: str,
+    ) -> BleakClient:
+        """Connect to one explicit Home Assistant Bluetooth source."""
+        _LOGGER.info(
+            "Connecting %s through %s source %s (RSSI %d)",
+            self.name,
+            route,
+            source or "unknown",
+            rssi,
+        )
+        self._last_connection_source = source
+        try:
+            client = await establish_connection(
+                BleakClient,
+                device,
+                self.name,
+                max_attempts=3,
+            )
+        except Exception:
+            self._failed_connection_source = source
+            self._failed_connection_at = monotonic()
+            raise
+
+        return client
+
+    async def _async_create_client(self, _device: str | BLEDevice) -> BleakClient:
+        """Connect through the best current source, avoiding a recent failure."""
+        candidates = self._connection_candidates()
+        if not candidates:
             raise BleakNotFoundError(
                 f"Could not find connectable Tion {self.config[CONF_MAC]}"
             )
-        return await establish_connection(
-            BleakClient,
-            device,
-            self.name,
-            max_attempts=3,
+
+        if (
+            self._failed_connection_source is not None
+            and self._failed_connection_at is not None
+            and monotonic() - self._failed_connection_at
+            < ALTERNATE_SOURCE_COOLDOWN_SECONDS
+        ):
+            candidates.sort(
+                key=lambda candidate: candidate[1] == self._failed_connection_source
+            )
+
+        return await self._async_connect_candidate(*candidates[0], route="primary")
+
+    async def _async_create_alternate_client(
+        self, _device: str | BLEDevice
+    ) -> BleakClient:
+        """Connect through a different scanner after a full BLE session failure."""
+        candidates = self._connection_candidates()
+        if not candidates:
+            raise BleakNotFoundError(
+                f"Could not find connectable Tion {self.config[CONF_MAC]}"
+            )
+
+        alternate = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate[1] != self._last_connection_source
+            ),
+            candidates[0],
         )
+        return await self._async_connect_candidate(*alternate, route="alternate")
 
     async def async_update_state(self):
         self.logger.info("Tion instance update started")

@@ -16,6 +16,10 @@ _LOGGER = logging.getLogger(__name__)
 
 BluetoothDevice = str | BLEDevice
 ClientFactory = Callable[[BluetoothDevice], Awaitable[BleakClient]]
+SessionFailureCallback = Callable[[Exception], None]
+
+FULL_SESSION_ATTEMPTS = 2
+FULL_SESSION_RETRY_DELAY_SECONDS = 2
 
 
 class MaxTriesExceededError(Exception):
@@ -88,6 +92,8 @@ class Tion:
         self._btle_device: BluetoothDevice = mac
         self._next_btle_device: BluetoothDevice | None = None
         self._client_factory: ClientFactory | None = None
+        self._alternate_client_factory: ClientFactory | None = None
+        self._session_failure_callback: SessionFailureCallback | None = None
         self._delegation = TionDelegation()
         self._fan_speed = 0
         self._model: str = self.__class__.__name__
@@ -391,13 +397,18 @@ class Tion:
         return status
 
     @final
-    async def _try_connect(self) -> bool:
+    async def _try_connect(self, use_alternate: bool = False) -> bool:
         """Create a fresh client and connect it to the latest device."""
         device = self.set_new_btle_device()
         client = None
         try:
-            if self._client_factory is not None:
-                client = await self._client_factory(device)
+            client_factory = (
+                self._alternate_client_factory
+                if use_alternate and self._alternate_client_factory is not None
+                else self._client_factory
+            )
+            if client_factory is not None:
+                client = await client_factory(device)
             else:
                 client = BleakClient(device)
                 await client.connect()
@@ -420,27 +431,69 @@ class Tion:
     @final
     async def _connect(self, need_notifications: bool = True):
         _LOGGER.debug(f"Connecting. {self.connection_status=}.")
-        if self.connection_status == "disc":
+        if self.connection_status != "disc":
+            _LOGGER.debug(f"_connect done. {self.connection_status=}.")
+            return
+
+        for attempt in range(FULL_SESSION_ATTEMPTS):
+            use_alternate = attempt > 0 and self._alternate_client_factory is not None
             try:
                 if self._client_factory is not None:
-                    await self._try_connect()
+                    await self._try_connect(use_alternate=use_alternate)
                 else:
                     await self._try_connect_with_retries()
-            except exc.BleakError as e:
-                _LOGGER.warning(f"Got {str(e)=} exception in _connect")
-                raise e
-
-            try:
                 if need_notifications:
                     await self._enable_notifications()
                 else:
                     _LOGGER.debug("Notifications was not requested")
-            except Exception:
+                break
+            except Exception as err:
+                if self._session_failure_callback is not None:
+                    try:
+                        self._session_failure_callback(err)
+                    except Exception:
+                        _LOGGER.exception(
+                            "Ignoring exception from BLE session failure callback"
+                        )
                 # A client that connected but failed during GATT setup is not
-                # safe to reuse. Drop it so the next attempt resolves the
-                # current BLE device and creates a fresh client.
-                await self._disconnect()
-                raise
+                # safe to reuse. Drop it before retrying the complete session,
+                # including service discovery and notification subscription.
+                try:
+                    await self._disconnect()
+                except Exception as disconnect_err:
+                    # A broken BlueZ/GATT session may also fail while closing.
+                    # That must not prevent the next attempt from using the
+                    # freshly cleared client reference.
+                    _LOGGER.debug(
+                        "Ignoring disconnect error while recovering %s: %s",
+                        self.mac,
+                        disconnect_err,
+                    )
+
+                if attempt + 1 >= FULL_SESSION_ATTEMPTS:
+                    _LOGGER.warning(
+                        "Bluetooth session failed after %d attempts for %s: %s",
+                        FULL_SESSION_ATTEMPTS,
+                        self.mac,
+                        err,
+                    )
+                    raise
+
+                retry_route = (
+                    " with the alternate client factory"
+                    if self._alternate_client_factory is not None
+                    else ""
+                )
+                _LOGGER.info(
+                    "Bluetooth session attempt %d/%d failed for %s: %s. "
+                    "Retrying the complete session%s",
+                    attempt + 1,
+                    FULL_SESSION_ATTEMPTS,
+                    self.mac,
+                    err,
+                    retry_route,
+                )
+                await asyncio.sleep(FULL_SESSION_RETRY_DELAY_SECONDS)
         _LOGGER.debug(f"_connect done. {self.connection_status=}.")
 
     @final
@@ -730,3 +783,15 @@ class Tion:
     def set_client_factory(self, client_factory: ClientFactory) -> None:
         """Set an async factory that returns an already connected fresh client."""
         self._client_factory = client_factory
+
+    @final
+    def set_alternate_client_factory(self, client_factory: ClientFactory) -> None:
+        """Set a client factory used by the second full connection attempt."""
+        self._alternate_client_factory = client_factory
+
+    @final
+    def set_session_failure_callback(
+        self, callback: SessionFailureCallback
+    ) -> None:
+        """Set a callback invoked whenever a complete BLE session fails."""
+        self._session_failure_callback = callback
