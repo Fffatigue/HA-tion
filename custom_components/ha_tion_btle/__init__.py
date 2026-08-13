@@ -59,21 +59,30 @@ async def async_setup_entry(hass, config_entry: ConfigEntry):
         )
     )
 
+    refresh_task = hass.async_create_task(instance.async_config_entry_first_refresh())
     try:
-        async with asyncio.timeout(SETUP_TIMEOUT_SECONDS):
-            await instance.async_config_entry_first_refresh()
-    except TimeoutError as err:
-        await _async_cleanup_failed_setup(hass, domain_data, entry_key, instance)
-        raise ConfigEntryNotReady(
-            f"Timed out setting up Tion after {SETUP_TIMEOUT_SECONDS} seconds"
-        ) from err
+        done, _pending = await asyncio.wait(
+            {refresh_task},
+            timeout=SETUP_TIMEOUT_SECONDS,
+        )
+        if not done:
+            _cancel_and_detach_task(refresh_task)
+            raise ConfigEntryNotReady(
+                f"Timed out setting up Tion after {SETUP_TIMEOUT_SECONDS} seconds"
+            )
+        refresh_task.result()
+    except ConfigEntryNotReady:
+        await _async_finish_failed_setup(hass, domain_data, entry_key, instance)
+        raise
     except asyncio.CancelledError:
+        _cancel_and_detach_task(refresh_task)
         await asyncio.shield(
             _async_cleanup_failed_setup(hass, domain_data, entry_key, instance)
         )
         raise
     except Exception:
-        await _async_cleanup_failed_setup(hass, domain_data, entry_key, instance)
+        _cancel_and_detach_task(refresh_task)
+        await _async_finish_failed_setup(hass, domain_data, entry_key, instance)
         raise
     config_entry.async_on_unload(
         config_entry.add_update_listener(_async_reload_entry)
@@ -81,6 +90,21 @@ async def async_setup_entry(hass, config_entry: ConfigEntry):
 
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
     return True
+
+
+def _consume_task_result(task: asyncio.Task) -> None:
+    """Consume completion from a detached task without hiding setup errors."""
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+def _cancel_and_detach_task(task: asyncio.Task) -> None:
+    """Request cancellation without waiting for a resistant coroutine."""
+    if not task.done():
+        task.cancel()
+    task.add_done_callback(_consume_task_result)
 
 
 async def _async_cleanup_failed_setup(
@@ -116,6 +140,23 @@ async def _async_cleanup_failed_setup(
             instance.name,
             err,
         )
+
+
+async def _async_finish_failed_setup(
+    hass: HomeAssistant,
+    domain_data: dict,
+    entry_key: str,
+    instance: TionInstance,
+) -> None:
+    """Run cleanup as a task so outer cancellation cannot interrupt it."""
+    cleanup_task = hass.async_create_task(
+        _async_cleanup_failed_setup(hass, domain_data, entry_key, instance)
+    )
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        _cancel_and_detach_task(cleanup_task)
+        raise
 
 
 async def _async_reload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
