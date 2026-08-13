@@ -32,19 +32,12 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     }
 )
 
-devices = []
-
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry, async_add_entities: AddEntitiesCallback):
     """Setup entry"""
-    tion_instance: TionInstance = hass.data[DOMAIN][config_entry.unique_id]
-    unique_id = tion_instance.unique_id
-
-    if unique_id not in devices:
-        devices.append(unique_id)
-        async_add_entities([TionClimateEntity(hass, tion_instance)])
-    else:
-        _LOGGER.warning(f"Device {unique_id} is already configured! ")
+    entry_key = config_entry.unique_id or config_entry.entry_id
+    tion_instance: TionInstance = hass.data[DOMAIN][entry_key]
+    async_add_entities([TionClimateEntity(hass, tion_instance)])
 
     platform = entity_platform.async_get_current_platform()
     platform.async_register_entity_service(
@@ -93,6 +86,9 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
         self._is_boost: bool = False
         self._fan_speed = 1
 
+        # Preset lists are mutable. Build an instance-owned list so reloading
+        # one entry cannot append AWAY to every climate entity in the process.
+        self._attr_preset_modes = [PRESET_NONE, PRESET_BOOST, PRESET_SLEEP]
         if self._away_temp:
             self._attr_preset_modes.append(PRESET_AWAY)
 
@@ -117,14 +113,7 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
             await self._async_set_state(is_on=False)
 
         elif hvac_mode == HVACMode.HEAT:
-            saved_target_temp = self.target_temperature
-            try:
-                await self.coordinator.connect()
-                await self._async_set_state(heater=True, is_on=True)
-                if self.hvac_mode == HVACMode.FAN_ONLY:
-                    await self.async_set_temperature(**{ATTR_TEMPERATURE: saved_target_temp})
-            finally:
-                await self.coordinator.disconnect()
+            await self._async_set_state(heater=True, is_on=True)
         elif hvac_mode == HVACMode.FAN_ONLY:
             await self._async_set_state(heater=False, is_on=True)
 
@@ -136,30 +125,36 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
 
     async def async_set_preset_mode(self, preset_mode: str):
         """Set new preset mode."""
-        actions = []
+        old_is_boost = self._is_boost
+        old_saved_target_temp = self._saved_target_temp
+        old_saved_fan_mode = self._saved_fan_mode
+        settings = {}
         _LOGGER.debug("Going to change preset mode from %s to %s", self.preset_mode, preset_mode)
         if preset_mode == PRESET_AWAY and self.preset_mode != PRESET_AWAY:
             _LOGGER.info("Going to AWAY mode. Will save target temperature %s", self.target_temperature)
             self._saved_target_temp = self.target_temperature
-            actions.append([self._async_set_state, {'heater_temp': self._away_temp}])
+            settings["heater_temp"] = self._away_temp
 
         if preset_mode != PRESET_AWAY and self.preset_mode == PRESET_AWAY and self._saved_target_temp:
             # retuning from away mode
             _LOGGER.info("Returning from AWAY mode: will set saved temperature %s", self._saved_target_temp)
-            actions.append([self._async_set_state, {'heater_temp': self._saved_target_temp}])
+            settings["heater_temp"] = self._saved_target_temp
             self._saved_target_temp = None
 
         if preset_mode == PRESET_SLEEP and self.preset_mode != PRESET_SLEEP:
             _LOGGER.info("Going to night mode: will save fan_speed: %s", self.fan_mode)
             if self._saved_fan_mode is None:
                 self._saved_fan_mode = int(self.fan_mode)
-            actions.append([self.async_set_fan_mode, {'fan_mode': min(int(self.fan_mode), self.sleep_max_fan_mode)}])
+            settings["fan_speed"] = min(
+                int(self.fan_mode),
+                self.sleep_max_fan_mode,
+            )
 
         if preset_mode == PRESET_BOOST and not self._is_boost:
             self._is_boost = True
             if self._saved_fan_mode is None:
                 self._saved_fan_mode = int(self.fan_mode)
-            actions.append([self.async_set_fan_mode, {'fan_mode': self.boost_fan_mode}])
+            settings["fan_speed"] = self.boost_fan_mode
 
         if self.preset_mode in [PRESET_BOOST, PRESET_SLEEP] and preset_mode not in [PRESET_BOOST, PRESET_SLEEP]:
             # returning from boost or sleep mode
@@ -168,19 +163,19 @@ class TionClimateEntity(ClimateEntity, CoordinatorEntity):
                 self._is_boost = False
 
             if self._saved_fan_mode is not None:
-                actions.append([self.async_set_fan_mode, {'fan_mode': self._saved_fan_mode}])
+                settings["fan_speed"] = self._saved_fan_mode
                 self._saved_fan_mode = None
 
-        self._attr_preset_mode = preset_mode
-        try:
-            await self.coordinator.connect()
-            for a in actions:
-                await a[0](**a[1])
-            self._attr_preset_mode = preset_mode
-            self._handle_coordinator_update()
-        finally:
-            await self.coordinator.disconnect()
+        if settings:
+            try:
+                await self._async_set_state(**settings)
+            except Exception:
+                self._is_boost = old_is_boost
+                self._saved_target_temp = old_saved_target_temp
+                self._saved_fan_mode = old_saved_fan_mode
+                raise
 
+        self._attr_preset_mode = preset_mode
         self._handle_coordinator_update()
 
     @property

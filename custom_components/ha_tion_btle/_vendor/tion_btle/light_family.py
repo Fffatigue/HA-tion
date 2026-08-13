@@ -33,11 +33,7 @@ class TionLiteFamily(Tion):
 
     def __init__(self, mac: str | BLEDevice):
         super().__init__(mac)
-        self._data: bytearray = bytearray()
-        self._crc: bytearray = bytearray()
-        self._header: bytearray = bytearray()
-        self._have_full_package: bool = False
-        self._got_new_sequence: bool = False
+        self._reset_message_assembly()
         self.have_breezer_state: bool = False
 
         # states
@@ -67,18 +63,33 @@ class TionLiteFamily(Tion):
         return [self.random, self.random, self.random, self.random]
 
     @final
+    def _reset_message_assembly(self) -> None:
+        """Discard all state belonging to an incomplete response frame."""
+        self._data: bytearray = bytearray()
+        self._crc: bytearray = bytearray()
+        self._header: bytearray = bytearray()
+        self._have_full_package: bool = False
+        self._got_new_sequence: bool = False
+
+    @final
     def _collect_message(self, package: bytearray) -> bool:
         self._have_full_package = False
 
         _LOGGER.debug("Got %s from tion", bytes(package).hex())
 
+        if not package:
+            _LOGGER.error("Got an empty package")
+            self._reset_message_assembly()
+            return False
+
         if package[0] == self.FIRST_PACKET_ID or package[0] == self.SINGLE_PACKET_ID:
-            self._data = package
+            self._data = bytearray(package)
             self._have_full_package = True if package[0] == self.SINGLE_PACKET_ID else False
             self._got_new_sequence = True if package[0] == self.FIRST_PACKET_ID else False
         elif package[0] == self.MIDDLE_PACKET_ID:
             if not self._got_new_sequence:
                 _LOGGER.critical("Got middle packet but waiting for a first!")
+                self._reset_message_assembly()
             else:
                 package = list(package)
                 package.pop(0)
@@ -86,6 +97,7 @@ class TionLiteFamily(Tion):
         elif package[0] == self.END_PACKET_ID:
             if not self._got_new_sequence:
                 _LOGGER.critical("Got end packet but waiting for a first!")
+                self._reset_message_assembly()
             else:
                 self._have_full_package = True
                 self._got_new_sequence = False
@@ -94,11 +106,21 @@ class TionLiteFamily(Tion):
                 self._data += bytearray(package)
         else:
             _LOGGER.error("Unknown package id %s", hex(package[0]))
+            self._reset_message_assembly()
 
         if self._have_full_package:
-            self._header = self._data[:15]
-            self._data = self._data[15:-2]
-            self._crc = self._data[-2:]
+            frame = self._data
+            minimum_frame_length = 15 + 2
+            if len(frame) < minimum_frame_length:
+                _LOGGER.error(
+                    "Got a complete frame shorter than header + CRC: %d bytes",
+                    len(frame),
+                )
+                self._reset_message_assembly()
+                return False
+            self._header = frame[:15]
+            self._crc = frame[-2:]
+            self._data = frame[15:-2]
 
         return self._have_full_package
 

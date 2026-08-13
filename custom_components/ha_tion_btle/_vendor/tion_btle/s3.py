@@ -14,6 +14,8 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class TionS3(Tion):
+    MIN_RESPONSE_LENGTH = 19
+
     uuid = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
     uuid_write = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
     uuid_notify = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
@@ -62,25 +64,45 @@ class TionS3(Tion):
 
     def _decode_response(self, response: bytearray):
         _LOGGER.debug("Data is %s", bytes(response).hex())
-        try:
-            self._fan_speed = int(list("{:02x}".format(response[2]))[1])
-            self._mode = int(list("{:02x}".format(response[2]))[0])
-            self._heater = response[4] & 1
-            self._state = response[4] >> 1 & 1
-            self._heater_temp = response[3]
-            self._sound = response[4] >> 3 & 1
-            self._out_temp = self.decode_temperature(response[7])
-            self._in_temp = self.decode_temperature(response[8])
-            self._filter_remain = response[10] * 256 + response[9]
-            self._error_code = response[13]
+        if len(response) < self.MIN_RESPONSE_LENGTH:
+            raise TionException(
+                "s3 _decode_response",
+                "Got bad response from Tion "
+                f"'{response}': expected at least {self.MIN_RESPONSE_LENGTH} "
+                f"bytes, got {len(response)}",
+            )
 
-            self._timer = self._process_status(response[4] >> 2 & 1)
-            self._time = "{}:{}".format(response[11], response[12])
-            self._productivity = response[14]
-            self._fw_version = "{:02x}{:02x}".format(response[18], response[17])
+        # Decode into locals first. A truncated or otherwise invalid frame must
+        # not leave half of the previously confirmed state overwritten.
+        fan_speed = int(list("{:02x}".format(response[2]))[1])
+        mode = int(list("{:02x}".format(response[2]))[0])
+        heater = response[4] & 1
+        state = response[4] >> 1 & 1
+        heater_temp = response[3]
+        sound = response[4] >> 3 & 1
+        out_temp = self.decode_temperature(response[7])
+        in_temp = self.decode_temperature(response[8])
+        filter_remain = response[10] * 256 + response[9]
+        error_code = response[13]
+        timer = self._process_status(response[4] >> 2 & 1)
+        time = "{}:{}".format(response[11], response[12])
+        productivity = response[14]
+        fw_version = "{:02x}{:02x}".format(response[18], response[17])
 
-        except IndexError as e:
-            raise TionException("s3 _decode_response", "Got bad response from Tion '%s': %s while parsing" % (response, str(e)))
+        self._fan_speed = fan_speed
+        self._mode = mode
+        self._heater = heater
+        self._state = state
+        self._heater_temp = heater_temp
+        self._sound = sound
+        self._out_temp = out_temp
+        self._in_temp = in_temp
+        self._filter_remain = filter_remain
+        self._error_code = error_code
+        self._timer = timer
+        self._time = time
+        self._productivity = productivity
+        self._fw_version = fw_version
 
     def _generate_model_specific_json(self) -> dict:
         return {

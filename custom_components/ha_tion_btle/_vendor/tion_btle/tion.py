@@ -5,7 +5,7 @@ import asyncio
 import inspect
 import logging
 from asyncio import Semaphore
-from typing import Awaitable, Callable, List, final
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union, final
 from time import localtime, monotonic, strftime
 
 from bleak import BleakClient
@@ -14,12 +14,15 @@ from bleak.backends.device import BLEDevice
 
 _LOGGER = logging.getLogger(__name__)
 
-BluetoothDevice = str | BLEDevice
+BluetoothDevice = Union[str, BLEDevice]
 ClientFactory = Callable[[BluetoothDevice], Awaitable[BleakClient]]
 SessionFailureCallback = Callable[[Exception], None]
 
 FULL_SESSION_ATTEMPTS = 2
 FULL_SESSION_RETRY_DELAY_SECONDS = 2
+GET_SESSION_ATTEMPTS = 2
+GET_SESSION_RETRY_DELAY_SECONDS = 2
+RESPONSE_TIMEOUT_SECONDS = 10.0
 
 
 class MaxTriesExceededError(Exception):
@@ -59,6 +62,7 @@ def retry(retries: int = 2, delay: int = 0):
 class TionDelegation:
     def __init__(self):
         self._data: List[bytearray] = []
+        self._generation = 0
 
     def handleNotification(self, handle: int, data: bytearray):
         self._data.append(data)
@@ -72,6 +76,32 @@ class TionDelegation:
     @property
     def haveNewData(self) -> bool:
         return len(self._data) > 0
+
+    def clear(self) -> None:
+        """Discard all queued notifications."""
+        self._data.clear()
+
+    def begin_session(self) -> Callable[[int, bytearray], None]:
+        """Start a new notification generation and return its callback."""
+        self._generation += 1
+        generation = self._generation
+        self.clear()
+
+        def handle_notification(handle: int, data: bytearray) -> None:
+            if generation != self._generation:
+                _LOGGER.debug(
+                    "Ignoring notification from stale BLE session generation %d",
+                    generation,
+                )
+                return
+            self.handleNotification(handle, data)
+
+        return handle_notification
+
+    def end_session(self) -> None:
+        """Invalidate the active notification callback and clear its queue."""
+        self._generation += 1
+        self.clear()
 
 
 class TionException(Exception):
@@ -88,12 +118,12 @@ class Tion:
 
     def __init__(self, mac: BluetoothDevice):
         self._mac = mac
-        self._btle: BleakClient | None = None
+        self._btle: Optional[BleakClient] = None
         self._btle_device: BluetoothDevice = mac
-        self._next_btle_device: BluetoothDevice | None = None
-        self._client_factory: ClientFactory | None = None
-        self._alternate_client_factory: ClientFactory | None = None
-        self._session_failure_callback: SessionFailureCallback | None = None
+        self._next_btle_device: Optional[BluetoothDevice] = None
+        self._client_factory: Optional[ClientFactory] = None
+        self._alternate_client_factory: Optional[ClientFactory] = None
+        self._session_failure_callback: Optional[SessionFailureCallback] = None
         self._delegation = TionDelegation()
         self._fan_speed = 0
         self._model: str = self.__class__.__name__
@@ -118,7 +148,7 @@ class Tion:
         # collected and is intentionally reset for every connection/request.
         # Keep the last decoded full device state separately so a SET can
         # preserve unchanged fields without issuing a preliminary GET.
-        self._state_cache_updated_at: float | None = None
+        self._state_cache_updated_at: Optional[float] = None
         self._state_cache_ttl: float = 0.0
         self._connection_lock = Semaphore(1)
         self._operation_lock = asyncio.Lock()
@@ -127,9 +157,11 @@ class Tion:
         # a weak connection is still busy; merge those values so the next
         # transaction applies the latest requested state instead of replaying
         # a stale queue for minutes.
-        self._pending_set_settings: dict = {}
-        self._pending_set_waiters: list[asyncio.Future[dict]] = []
-        self._set_worker_task: asyncio.Task[None] | None = None
+        self._pending_set_requests: List[
+            Tuple[Dict[str, Any], asyncio.Future]
+        ] = []
+        self._active_set_waiters: List[asyncio.Future] = []
+        self._set_worker_task: Optional[asyncio.Task] = None
 
     @abc.abstractmethod
     async def _send_request(self, request: bytearray):
@@ -211,15 +243,38 @@ class Tion:
         Get current state from breezer
         :return: None
         """
-        try:
-            await self.connect()
-            await self._try_write(request=self.command_getStatus)
-            response = await self._get_data_from_breezer()
-        finally:
-            await self.disconnect()
+        for attempt in range(GET_SESSION_ATTEMPTS):
+            connected = False
+            try:
+                await self.connect(prefer_alternate=attempt > 0)
+                connected = True
+                self._reset_response_state()
+                await self._try_write(request=self.command_getStatus)
+                response = await self._get_data_from_breezer()
+                self._decode_response(response)
+                self._mark_state_cache_updated()
+                return
+            except asyncio.CancelledError:
+                self._invalidate_state_cache()
+                raise
+            except Exception as err:
+                self._invalidate_state_cache()
+                self._report_session_failure(err)
+                if attempt + 1 >= GET_SESSION_ATTEMPTS:
+                    raise
+                _LOGGER.info(
+                    "GET session attempt %d/%d failed for %s: %s. "
+                    "Retrying through a fresh session",
+                    attempt + 1,
+                    GET_SESSION_ATTEMPTS,
+                    self.mac,
+                    err,
+                )
+            finally:
+                if connected:
+                    await self._release_connection_after_operation()
 
-        self._decode_response(response)
-        self._mark_state_cache_updated()
+            await asyncio.sleep(GET_SESSION_RETRY_DELAY_SECONDS)
 
     @final
     async def get(self, skip_update: bool = False) -> dict:
@@ -283,8 +338,7 @@ class Tion:
             pass
 
         waiter = asyncio.get_running_loop().create_future()
-        self._pending_set_settings.update(new_settings)
-        self._pending_set_waiters.append(waiter)
+        self._pending_set_requests.append((new_settings, waiter))
 
         if self._set_worker_task is None or self._set_worker_task.done():
             self._set_worker_task = asyncio.create_task(self._drain_pending_sets())
@@ -294,55 +348,106 @@ class Tion:
     async def _drain_pending_sets(self) -> None:
         """Execute one active SET and one latest-value pending SET at a time."""
         try:
-            while self._pending_set_waiters:
-                settings = self._pending_set_settings
-                waiters = self._pending_set_waiters
-                self._pending_set_settings = {}
-                self._pending_set_waiters = []
+            while self._pending_set_requests:
+                requests = self._pending_set_requests
+                self._pending_set_requests = []
+                requests = [
+                    (settings, waiter)
+                    for settings, waiter in requests
+                    if not waiter.cancelled()
+                ]
+                if not requests:
+                    continue
 
-                if len(waiters) > 1:
+                settings: Dict[str, Any] = {}
+                for requested_settings, _waiter in requests:
+                    settings.update(requested_settings)
+                self._active_set_waiters = [
+                    waiter for _settings, waiter in requests
+                ]
+
+                if len(self._active_set_waiters) > 1:
                     _LOGGER.debug(
                         "Coalesced %d pending SET requests into %s",
-                        len(waiters),
+                        len(self._active_set_waiters),
                         settings,
                     )
 
                 try:
                     result = await self._set(settings)
                 except Exception as err:
-                    for waiter in waiters:
+                    for waiter in self._active_set_waiters:
                         if not waiter.done():
                             waiter.set_exception(err)
                 else:
-                    for waiter in waiters:
+                    for waiter in self._active_set_waiters:
                         if not waiter.done():
                             waiter.set_result(result)
+                self._active_set_waiters = []
+        except asyncio.CancelledError:
+            for waiter in self._active_set_waiters:
+                if not waiter.done():
+                    waiter.cancel()
+            for _settings, waiter in self._pending_set_requests:
+                if not waiter.done():
+                    waiter.cancel()
+            self._pending_set_requests = []
+            raise
         finally:
+            for waiter in self._active_set_waiters:
+                if not waiter.done():
+                    waiter.cancel()
+            self._active_set_waiters = []
             self._set_worker_task = None
 
     async def _set(self, new_settings: dict) -> dict:
         """Execute a single SET transaction."""
         async with self._operation_lock:
+            connected = False
             try:
+                # A stale cache requires an idempotent GET first, before the
+                # exactly-once SET owns any connection reference. Otherwise a
+                # nested GET retry cannot replace the primary physical client
+                # with an alternate route while the outer SET lease is held.
+                current_settings = None
+                if not self._has_fresh_state_cache():
+                    current_settings = await self._get(skip_update=False)
+
                 await self.connect()
-                current_settings = await self._get(skip_update=True)
+                connected = True
+                if current_settings is None:
+                    current_settings = await self._get(skip_update=True)
 
                 merged_settings = {**current_settings, **new_settings}
 
                 encoded_request = self._encode_request(merged_settings)
                 _LOGGER.debug("Will write %s", encoded_request)
+                self._reset_response_state()
                 await self._send_request(encoded_request)
                 response = await self._get_data_from_breezer()
                 self._decode_response(response)
                 self._mark_state_cache_updated()
                 return await self._get(skip_update=True)
-            except Exception:
+            except BaseException:
                 # The write may have reached the breezer while its response was
                 # lost. Do not trust the old full-state cache on the next SET.
                 self._invalidate_state_cache()
+                self._reset_response_state()
                 raise
             finally:
-                await self.disconnect()
+                if connected:
+                    await self._release_connection_after_operation()
+
+    async def _release_connection_after_operation(self) -> None:
+        """Release an operation's reference even while it is being cancelled."""
+        disconnect_task = asyncio.create_task(self.disconnect())
+        try:
+            await asyncio.shield(disconnect_task)
+        except asyncio.CancelledError:
+            try:
+                await disconnect_task
+            finally:
+                raise
 
     @final
     def set_state_cache_ttl(self, seconds: float) -> None:
@@ -365,6 +470,25 @@ class Tion:
         if self._state_cache_ttl <= 0 or self._state_cache_updated_at is None:
             return False
         return monotonic() - self._state_cache_updated_at <= self._state_cache_ttl
+
+    def _report_session_failure(self, err: Exception) -> None:
+        """Notify the host about a failed BLE session without breaking retry."""
+        if self._session_failure_callback is None:
+            return
+        try:
+            self._session_failure_callback(err)
+        except Exception:
+            _LOGGER.exception("Ignoring exception from BLE session failure callback")
+
+    def _reset_message_assembly(self) -> None:
+        """Reset model-specific partial-frame state before another response."""
+
+    def _reset_response_state(self) -> None:
+        """Discard notifications and partial frames from an earlier request."""
+        self.have_breezer_state = False
+        self._delegation.clear()
+        self._data = bytearray()
+        self._reset_message_assembly()
 
     @final
     @property
@@ -402,17 +526,20 @@ class Tion:
         device = self.set_new_btle_device()
         client = None
         try:
-            client_factory = (
-                self._alternate_client_factory
-                if use_alternate and self._alternate_client_factory is not None
-                else self._client_factory
-            )
+            if use_alternate:
+                client_factory = (
+                    self._alternate_client_factory or self._client_factory
+                )
+            else:
+                client_factory = (
+                    self._client_factory or self._alternate_client_factory
+                )
             if client_factory is not None:
                 client = await client_factory(device)
             else:
                 client = BleakClient(device)
                 await client.connect()
-        except Exception:
+        except BaseException:
             if client is not None and client.is_connected:
                 await client.disconnect()
             raise
@@ -429,16 +556,26 @@ class Tion:
         return await self._try_connect()
 
     @final
-    async def _connect(self, need_notifications: bool = True):
+    async def _connect(
+        self,
+        need_notifications: bool = True,
+        prefer_alternate: bool = False,
+    ):
         _LOGGER.debug(f"Connecting. {self.connection_status=}.")
         if self.connection_status != "disc":
             _LOGGER.debug(f"_connect done. {self.connection_status=}.")
             return
 
         for attempt in range(FULL_SESSION_ATTEMPTS):
-            use_alternate = attempt > 0 and self._alternate_client_factory is not None
+            use_alternate = (
+                self._alternate_client_factory is not None
+                and (prefer_alternate != (attempt > 0))
+            )
             try:
-                if self._client_factory is not None:
+                if (
+                    self._client_factory is not None
+                    or self._alternate_client_factory is not None
+                ):
                     await self._try_connect(use_alternate=use_alternate)
                 else:
                     await self._try_connect_with_retries()
@@ -448,13 +585,7 @@ class Tion:
                     _LOGGER.debug("Notifications was not requested")
                 break
             except Exception as err:
-                if self._session_failure_callback is not None:
-                    try:
-                        self._session_failure_callback(err)
-                    except Exception:
-                        _LOGGER.exception(
-                            "Ignoring exception from BLE session failure callback"
-                        )
+                self._report_session_failure(err)
                 # A client that connected but failed during GATT setup is not
                 # safe to reuse. Drop it before retrying the complete session,
                 # including service discovery and notification subscription.
@@ -502,6 +633,9 @@ class Tion:
         client = self._btle
         self._btle = None
         self.__notifications_enabled = False
+        self._delegation.end_session()
+        self._reset_message_assembly()
+        self.have_breezer_state = False
         try:
             if client is not None and client.is_connected:
                 await client.disconnect()
@@ -511,8 +645,13 @@ class Tion:
         _LOGGER.debug(f"_disconnect done. {self.connection_status=}")
 
     @final
-    @retry(retries=3)
     async def _try_write(self, request: bytearray):
+        """Write exactly once.
+
+        A failed GATT write is ambiguous: the breezer may have received it
+        even when the acknowledgement was lost. In particular, retrying a SET
+        blindly can replay an old command after a newer user action.
+        """
         _LOGGER.debug(f"Writing {bytes(request).hex()} to {self.uuid_write}, {self.connection_status=}")
         if self._btle is None:
             raise exc.BleakError("Tion is not connected")
@@ -528,8 +667,12 @@ class Tion:
         if self._btle is None:
             raise exc.BleakError("Tion is not connected")
         try:
-            await self._btle.start_notify(self.uuid_notify, self._delegation.handleNotification)
+            notification_callback = self._delegation.begin_session()
+            self._reset_message_assembly()
+            await self._btle.start_notify(self.uuid_notify, notification_callback)
         except exc.BleakError as e:
+            self._delegation.end_session()
+            self._reset_message_assembly()
             _LOGGER.warning("Got exception %s while enabling notifications!" % str(e))
             raise e
 
@@ -649,7 +792,11 @@ class Tion:
     @final
     @property
     def model(self) -> str:
-        return self._model.removeprefix("Tion")
+        return (
+            self._model[len("Tion"):]
+            if self._model.startswith("Tion")
+            else self._model
+        )
 
     @final
     def _encode_status(self, status: str) -> int:
@@ -673,9 +820,11 @@ class Tion:
     async def pair(self):
         async with self._operation_lock:
             _LOGGER.debug("Pairing")
-            await self._connect(need_notifications=False)
-            _LOGGER.debug("Connected. BT pairing ...")
+            connected = False
             try:
+                await self.connect(need_notifications=False)
+                connected = True
+                _LOGGER.debug("Connected. BT pairing ...")
                 if self._btle is None:
                     raise exc.BleakError("Tion is not connected")
                 await self._btle.pair()
@@ -687,19 +836,41 @@ class Tion:
                 _LOGGER.critical(f"Got exception while pair {type(e).__name__}: {str(e)}")
                 raise TionException('pair', f"{type(e).__name__}: {str(e)}")
             finally:
-                _LOGGER.debug("disconnected")
-                await self._disconnect()
+                if connected:
+                    await self._release_connection_after_operation()
+                _LOGGER.debug("Pair operation released its connection")
 
     @abc.abstractmethod
     async def _pair(self):
         """Perform model-specific pair steps"""
 
     @final
-    async def connect(self):
+    async def connect(
+        self,
+        prefer_alternate: bool = False,
+        need_notifications: bool = True,
+    ):
         async with self._connection_lock:
             if self.__connections_count == 0:
                 self.have_breezer_state = False
-                await self._connect()
+                try:
+                    await self._connect(
+                        need_notifications=need_notifications,
+                        prefer_alternate=prefer_alternate,
+                    )
+                except BaseException:
+                    # Cancellation is not an Exception on supported Python
+                    # versions. Still close a client that may already have
+                    # connected before propagating it to the caller.
+                    try:
+                        await self._disconnect_completely()
+                    except Exception as cleanup_err:
+                        _LOGGER.debug(
+                            "Ignoring connection cleanup error for %s: %s",
+                            self.mac,
+                            cleanup_err,
+                        )
+                    raise
             self.__connections_count += 1
 
     @final
@@ -709,10 +880,57 @@ class Tion:
                 return
             self.__connections_count -= 1
             if self.__connections_count == 0:
-                await self._disconnect()
-                self.have_breezer_state = False
-                while self._delegation.haveNewData:
-                    _LOGGER.debug(f"Cleaning data in disconnect: {self._delegation.data=}")
+                await self._disconnect_completely()
+
+    @final
+    async def async_close(self) -> None:
+        """Stop background work and force the BLE transport closed.
+
+        Home Assistant calls this while unloading an integration. Unlike
+        :meth:`disconnect`, shutdown must not trust the public connection
+        reference count: an operation may have been cancelled between
+        acquiring a reference and releasing it.
+        """
+        worker = self._set_worker_task
+        if worker is not None and worker is not asyncio.current_task():
+            if not worker.done():
+                worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                _LOGGER.exception("SET worker failed while closing %s", self.mac)
+
+        # Normally the worker cancellation path handles both its active batch
+        # and the pending batch. Repeat the cleanup here so shutdown also
+        # covers a worker that had already exited unexpectedly.
+        for _settings, waiter in self._pending_set_requests:
+            if not waiter.done():
+                waiter.cancel()
+        for waiter in self._active_set_waiters:
+            if not waiter.done():
+                waiter.cancel()
+        self._pending_set_requests = []
+        self._active_set_waiters = []
+        self._set_worker_task = None
+
+        async with self._connection_lock:
+            self.__connections_count = 0
+            await self._disconnect_completely()
+
+    async def _disconnect_completely(self) -> None:
+        """Finish physical cleanup even if the calling task is cancelled."""
+        disconnect_task = asyncio.create_task(self._disconnect())
+        try:
+            await asyncio.shield(disconnect_task)
+        except asyncio.CancelledError:
+            # The outer task has already consumed its cancellation. Waiting
+            # here prevents a ghost BlueZ connection from surviving it.
+            try:
+                await disconnect_task
+            finally:
+                raise
 
     @property
     @abc.abstractmethod
@@ -737,32 +955,26 @@ class Tion:
         :returns:
           breezer response
         """
-        self.have_breezer_state = False
-
         _LOGGER.debug("Collecting data")
+        deadline = monotonic() + RESPONSE_TIMEOUT_SECONDS
+        try:
+            while monotonic() < deadline:
+                if self._delegation.haveNewData:
+                    byte_response = self._delegation.data
+                    if self._collect_message(byte_response):
+                        self.have_breezer_state = True
+                        return self._data
+                    continue
 
-        i = 0
+                await asyncio.sleep(min(0.1, max(deadline - monotonic(), 0)))
 
-        while i < 10:
-            if self._delegation.haveNewData:
-                byte_response = self._delegation.data
-                if self._collect_message(byte_response):
-                    self.have_breezer_state = True
-                    break
-                i = 0
-            else:
-                await asyncio.sleep(1)
-            i += 1
-        else:
             _LOGGER.debug("Waiting too long for data")
-
-        if self.have_breezer_state:
-            result = self._data
-
-        else:
-            raise TionException("_get_data_from_breezer", "Could not get breezer state")
-
-        return result
+            raise TionException(
+                "_get_data_from_breezer", "Could not get breezer state"
+            )
+        except BaseException:
+            self._reset_response_state()
+            raise
 
     @final
     def update_btle_device(self, new_device: BluetoothDevice):

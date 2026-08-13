@@ -16,6 +16,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class TionLite(TionLiteFamily):
+    MIN_RESPONSE_LENGTH = 29
 
     def __init__(self, mac: str | BLEDevice):
         super().__init__(mac)
@@ -72,34 +73,58 @@ class TionLite(TionLiteFamily):
 
     def _decode_response(self, response: bytearray):
         _LOGGER.debug("Data is %s", bytes(response).hex())
-        try:
-            self._state = response[0] & 1
-            self._sound = response[0] >> 1 & 1
-            self._light = response[0] >> 2 & 1
-            self._filter_change_required = response[0] >> 4 & 1
-            self._co2_auto_control = response[0] >> 5 & 1
-            self._heater = response[0] >> 6 & 1
-            self._have_heater = response[0] >> 7 & 1
-
-            self._mode = response[2]
-            self._heater_temp = response[3]
-            self._fan_speed = response[4]
-            self._in_temp = self.decode_temperature(response[5])
-            self._out_temp = self.decode_temperature(response[6])
-            self._electronic_temp = response[7]
-            self._electronic_work_time = int.from_bytes(response[8:11], byteorder='little', signed=False) / 86400  # days
-            self._filter_remain = int.from_bytes(response[16:20], byteorder='little', signed=False) / 86400    # days
-            self._device_work_time = int.from_bytes(response[20:24], byteorder='little', signed=False) / 86400     # days
-            self._error_code = response[28]
-
-            # self._preset_temp = data[48:50]
-            # self._preset_fan = data[51:53]
-            # self._max_fan = data[54]
-            # self._heater_percent = data[55]
-        except IndexError as e:
+        if len(response) < self.MIN_RESPONSE_LENGTH:
             raise TionException(
-                "Lite _decode_response", "Got bad response from Tion '%s': %s while parsing" % (response, str(e))
+                "Lite _decode_response",
+                "Got bad response from Tion "
+                f"'{response}': expected at least {self.MIN_RESPONSE_LENGTH} "
+                f"bytes, got {len(response)}",
             )
+
+        state = response[0] & 1
+        sound = response[0] >> 1 & 1
+        light = response[0] >> 2 & 1
+        filter_change_required = response[0] >> 4 & 1
+        co2_auto_control = response[0] >> 5 & 1
+        heater = response[0] >> 6 & 1
+        have_heater = response[0] >> 7 & 1
+        mode = response[2]
+        heater_temp = response[3]
+        fan_speed = response[4]
+        in_temp = self.decode_temperature(response[5])
+        out_temp = self.decode_temperature(response[6])
+        electronic_temp = response[7]
+        electronic_work_time = (
+            int.from_bytes(response[8:11], byteorder="little", signed=False)
+            / 86400
+        )
+        filter_remain = (
+            int.from_bytes(response[16:20], byteorder="little", signed=False)
+            / 86400
+        )
+        device_work_time = (
+            int.from_bytes(response[20:24], byteorder="little", signed=False)
+            / 86400
+        )
+        error_code = response[28]
+
+        self._state = state
+        self._sound = sound
+        self._light = light
+        self._filter_change_required = filter_change_required
+        self._co2_auto_control = co2_auto_control
+        self._heater = heater
+        self._have_heater = have_heater
+        self._mode = mode
+        self._heater_temp = heater_temp
+        self._fan_speed = fan_speed
+        self._in_temp = in_temp
+        self._out_temp = out_temp
+        self._electronic_temp = electronic_temp
+        self._electronic_work_time = electronic_work_time
+        self._filter_remain = filter_remain
+        self._device_work_time = device_work_time
+        self._error_code = error_code
 
     def _generate_model_specific_json(self) -> dict:
         return {
@@ -126,7 +151,11 @@ class TionLite(TionLiteFamily):
             return result
 
         sb = 0x00  # ??
-        tb = 0x02 if (self.heater_temp > 0 or self.fan_speed > 0) else 0x01
+        tb = (
+            0x02
+            if int(request["heater_temp"]) > 0 or int(request["fan_speed"]) > 0
+            else 0x01
+        )
         lb = [0x60, 0x00] if sb == 0 else [0x00, 0x00]
 
         return bytearray(

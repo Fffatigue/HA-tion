@@ -16,6 +16,8 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class TionS4(TionLiteFamily):
+    MIN_RESPONSE_LENGTH = 20
+
     def __init__(self, mac: str | BLEDevice):
         super().__init__(mac)
 
@@ -39,22 +41,38 @@ class TionS4(TionLiteFamily):
 
     def _decode_response(self, response: bytearray):
         _LOGGER.debug("Data is %s", bytes(response).hex())
-        try:
-            self._mode = response[2]
-            self._heater_temp = response[3]
-            self._fan_speed = response[4]
-            self._in_temp = self.decode_temperature(response[5])
-            self._out_temp = self.decode_temperature(response[6])
-            self._filter_remain = int.from_bytes(response[17:20], byteorder='little', signed=False) / 86400
-            self._state = response[0] & 1
-            self._sound = response[0] >> 1 & 1
-            self._light = response[0] >> 2 & 1
-            self._heater = True if response[0] >> 4 & 1 == 0 else False
-        except IndexError as e:
+        if len(response) < self.MIN_RESPONSE_LENGTH:
             raise TionException(
                 "s4 _decode_response",
-                f"Got bad response from Tion '{response}': {str(e)} while parsing"
+                "Got bad response from Tion "
+                f"'{response}': expected at least {self.MIN_RESPONSE_LENGTH} "
+                f"bytes, got {len(response)}",
             )
+
+        mode = response[2]
+        heater_temp = response[3]
+        fan_speed = response[4]
+        in_temp = self.decode_temperature(response[5])
+        out_temp = self.decode_temperature(response[6])
+        filter_remain = (
+            int.from_bytes(response[17:20], byteorder="little", signed=False)
+            / 86400
+        )
+        state = response[0] & 1
+        sound = response[0] >> 1 & 1
+        light = response[0] >> 2 & 1
+        heater = response[0] >> 4 & 1 == 0
+
+        self._mode = mode
+        self._heater_temp = heater_temp
+        self._fan_speed = fan_speed
+        self._in_temp = in_temp
+        self._out_temp = out_temp
+        self._filter_remain = filter_remain
+        self._state = state
+        self._sound = sound
+        self._light = light
+        self._heater = heater
 
     def _generate_model_specific_json(self) -> dict:
         return {

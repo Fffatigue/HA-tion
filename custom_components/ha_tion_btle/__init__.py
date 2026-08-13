@@ -1,28 +1,32 @@
 """The Tion breezer component."""
 from __future__ import annotations
 
-from bleak import BleakClient
-from bleak.backends.device import BLEDevice
+import asyncio
 import datetime
+from functools import cached_property
 import logging
 import math
-from functools import cached_property
 from time import monotonic
 
+from bleak import BleakClient
+from bleak.backends.device import BLEDevice
 from bleak_retry_connector import BleakNotFoundError, establish_connection
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothCallbackMatcher
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+
 from ._vendor import tion_btle
 from ._vendor.tion_btle.tion import Tion
 from .const import DOMAIN, TION_SCHEMA, CONF_KEEP_ALIVE, CONF_AWAY_TEMP, CONF_MAC, PLATFORMS
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
 
 _LOGGER = logging.getLogger(__name__)
 
 ALTERNATE_SOURCE_COOLDOWN_SECONDS = 60
+SHUTDOWN_TIMEOUT_SECONDS = 10
+SETUP_TIMEOUT_SECONDS = 75
 
 
 async def async_setup(hass, config):
@@ -32,22 +36,81 @@ async def async_setup(hass, config):
 async def async_setup_entry(hass, config_entry: ConfigEntry):
     _LOGGER.info("Setting up %s ", config_entry.unique_id)
 
-    hass.data.setdefault(DOMAIN, {})
+    domain_data = hass.data.setdefault(DOMAIN, {})
 
-    instance = TionInstance(hass, config_entry)
-    hass.data[DOMAIN][config_entry.unique_id] = instance
+    try:
+        instance = TionInstance(hass, config_entry)
+    except Exception:
+        if not domain_data:
+            hass.data.pop(DOMAIN)
+        raise
+    entry_key = config_entry.unique_id or config_entry.entry_id
+    domain_data[entry_key] = instance
     config_entry.async_on_unload(
         bluetooth.async_register_callback(
             hass=hass,
             callback=instance.update_btle_device,
-            match_dict=BluetoothCallbackMatcher(address=instance.config[CONF_MAC], connectable=True),
+            match_dict=BluetoothCallbackMatcher(
+                address=instance.config[CONF_MAC],
+                connectable=True,
+            ),
             mode=bluetooth.BluetoothScanningMode.ACTIVE,
         )
     )
 
-    await hass.data[DOMAIN][config_entry.unique_id].async_config_entry_first_refresh()
+    try:
+        async with asyncio.timeout(SETUP_TIMEOUT_SECONDS):
+            await instance.async_config_entry_first_refresh()
+    except TimeoutError as err:
+        await instance.async_shutdown()
+        domain_data.pop(entry_key, None)
+        if not domain_data:
+            hass.data.pop(DOMAIN)
+        raise ConfigEntryNotReady(
+            f"Timed out setting up Tion after {SETUP_TIMEOUT_SECONDS} seconds"
+        ) from err
+    except asyncio.CancelledError:
+        await instance.async_shutdown()
+        domain_data.pop(entry_key, None)
+        if not domain_data:
+            hass.data.pop(DOMAIN)
+        raise
+    except Exception:
+        await instance.async_shutdown()
+        domain_data.pop(entry_key, None)
+        if not domain_data:
+            hass.data.pop(DOMAIN)
+        raise
+    config_entry.async_on_unload(
+        config_entry.add_update_listener(_async_reload_entry)
+    )
 
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+    return True
+
+
+async def _async_reload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
+    """Reload a Tion entry when its options change."""
+    await hass.config_entries.async_reload(config_entry.entry_id)
+
+
+async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+    """Unload platforms and release the coordinator and BLE connection."""
+    unload_ok = await hass.config_entries.async_unload_platforms(
+        config_entry,
+        PLATFORMS,
+    )
+    if not unload_ok:
+        return False
+
+    entry_key = config_entry.unique_id or config_entry.entry_id
+    instance = hass.data.get(DOMAIN, {}).pop(entry_key, None)
+    if instance is not None:
+        await instance.async_shutdown()
+
+    if not hass.data.get(DOMAIN):
+        hass.data.pop(DOMAIN, None)
+
     return True
 
 
@@ -82,6 +145,7 @@ class TionInstance(DataUpdateCoordinator):
         self._last_connection_source: str | None = None
         self._failed_connection_source: str | None = None
         self._failed_connection_at: float | None = None
+        self._tion_shutdown = False
 
         if self._config_entry.unique_id is None:
             _LOGGER.critical(f"Unique id is None for {self._config_entry.title}! "
@@ -96,6 +160,7 @@ class TionInstance(DataUpdateCoordinator):
             name=self.config['name'] if 'name' in self.config else TION_SCHEMA['name']['default'],
             hass=hass,
             logger=_LOGGER,
+            config_entry=config_entry,
             update_interval=self.__keep_alive,
             update_method=self.async_update_state,
         )
@@ -315,8 +380,24 @@ class TionInstance(DataUpdateCoordinator):
 
         args = ', '.join('%s=%r' % x for x in kwargs.items())
         _LOGGER.info("Need to set: " + args)
-        response = await self.__tion.set(kwargs)
+        try:
+            response = await self.__tion.set(kwargs)
+        except Exception as err:
+            self.async_set_update_error(err)
+            raise
         self.async_set_updated_data(self._prepare_response(response))
+
+    async def async_shutdown(self) -> None:
+        """Stop coordinator work and release an open BLE connection."""
+        if self._tion_shutdown:
+            return
+        self._tion_shutdown = True
+        await super().async_shutdown()
+        try:
+            async with asyncio.timeout(SHUTDOWN_TIMEOUT_SECONDS):
+                await self.__tion.async_close()
+        except Exception as err:
+            _LOGGER.debug("Error closing %s during unload: %s", self.name, err)
 
     @staticmethod
     def getTion(model: str, mac: str | BLEDevice) -> tion_btle.TionS3 | tion_btle.TionLite | tion_btle.TionS4:
@@ -329,12 +410,6 @@ class TionInstance(DataUpdateCoordinator):
         else:
             raise NotImplementedError("Model '%s' is not supported!" % model)
         return Breezer(mac)
-
-    async def connect(self):
-        return await self.__tion.connect()
-
-    async def disconnect(self):
-        return await self.__tion.disconnect()
 
     @property
     def device_info(self):
