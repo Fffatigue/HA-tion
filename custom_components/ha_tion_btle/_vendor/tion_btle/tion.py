@@ -23,10 +23,21 @@ FULL_SESSION_RETRY_DELAY_SECONDS = 2
 GET_SESSION_ATTEMPTS = 2
 GET_SESSION_RETRY_DELAY_SECONDS = 2
 RESPONSE_TIMEOUT_SECONDS = 10.0
+DISCONNECT_TIMEOUT_SECONDS = 5.0
 
 
 class MaxTriesExceededError(Exception):
     pass
+
+
+def _consume_background_task(task: asyncio.Task) -> None:
+    """Retrieve a detached cleanup task's eventual result."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        _LOGGER.debug("Detached BLE cleanup task failed", exc_info=True)
 
 
 def retry(retries: int = 2, delay: int = 0):
@@ -541,7 +552,16 @@ class Tion:
                 await client.connect()
         except BaseException:
             if client is not None and client.is_connected:
-                await client.disconnect()
+                try:
+                    await self._bounded_disconnect_client(
+                        client, "cancelled or failed connection"
+                    )
+                except Exception as disconnect_err:
+                    _LOGGER.debug(
+                        "Ignoring client cleanup error for %s: %s",
+                        self.mac,
+                        disconnect_err,
+                    )
             raise
 
         if not client.is_connected:
@@ -638,11 +658,40 @@ class Tion:
         self.have_breezer_state = False
         try:
             if client is not None and client.is_connected:
-                await client.disconnect()
+                await self._bounded_disconnect_client(client, "session cleanup")
         finally:
             self.set_new_btle_device()
 
         _LOGGER.debug(f"_disconnect done. {self.connection_status=}")
+
+    async def _bounded_disconnect_client(
+        self, client: BleakClient, reason: str
+    ) -> None:
+        """Disconnect one physical client without allowing cleanup to hang."""
+        disconnect_task = asyncio.create_task(client.disconnect())
+        try:
+            done, _pending = await asyncio.wait(
+                [disconnect_task], timeout=DISCONNECT_TIMEOUT_SECONDS
+            )
+        except asyncio.CancelledError:
+            disconnect_task.cancel()
+            disconnect_task.add_done_callback(_consume_background_task)
+            raise
+
+        if disconnect_task not in done:
+            _LOGGER.warning(
+                "Timed out after %.1fs disconnecting %s during %s",
+                DISCONNECT_TIMEOUT_SECONDS,
+                self.mac,
+                reason,
+            )
+            disconnect_task.cancel()
+            disconnect_task.add_done_callback(_consume_background_task)
+            return
+
+        # Preserve the old behavior for a completed disconnect: real transport
+        # errors still reach the caller, while only a hung cleanup is detached.
+        disconnect_task.result()
 
     @final
     async def _try_write(self, request: bytearray):

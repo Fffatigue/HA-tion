@@ -25,6 +25,7 @@ from .const import DOMAIN, TION_SCHEMA, CONF_KEEP_ALIVE, CONF_AWAY_TEMP, CONF_MA
 _LOGGER = logging.getLogger(__name__)
 
 ALTERNATE_SOURCE_COOLDOWN_SECONDS = 60
+SETUP_CLEANUP_TIMEOUT_SECONDS = 10
 SHUTDOWN_TIMEOUT_SECONDS = 10
 SETUP_TIMEOUT_SECONDS = 75
 
@@ -62,24 +63,17 @@ async def async_setup_entry(hass, config_entry: ConfigEntry):
         async with asyncio.timeout(SETUP_TIMEOUT_SECONDS):
             await instance.async_config_entry_first_refresh()
     except TimeoutError as err:
-        await instance.async_shutdown()
-        domain_data.pop(entry_key, None)
-        if not domain_data:
-            hass.data.pop(DOMAIN)
+        await _async_cleanup_failed_setup(hass, domain_data, entry_key, instance)
         raise ConfigEntryNotReady(
             f"Timed out setting up Tion after {SETUP_TIMEOUT_SECONDS} seconds"
         ) from err
     except asyncio.CancelledError:
-        await instance.async_shutdown()
-        domain_data.pop(entry_key, None)
-        if not domain_data:
-            hass.data.pop(DOMAIN)
+        await asyncio.shield(
+            _async_cleanup_failed_setup(hass, domain_data, entry_key, instance)
+        )
         raise
     except Exception:
-        await instance.async_shutdown()
-        domain_data.pop(entry_key, None)
-        if not domain_data:
-            hass.data.pop(DOMAIN)
+        await _async_cleanup_failed_setup(hass, domain_data, entry_key, instance)
         raise
     config_entry.async_on_unload(
         config_entry.add_update_listener(_async_reload_entry)
@@ -87,6 +81,41 @@ async def async_setup_entry(hass, config_entry: ConfigEntry):
 
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
     return True
+
+
+async def _async_cleanup_failed_setup(
+    hass: HomeAssistant,
+    domain_data: dict,
+    entry_key: str,
+    instance: TionInstance,
+) -> None:
+    """Remove setup state without letting resistant shutdown block setup."""
+    domain_data.pop(entry_key, None)
+    if not domain_data:
+        hass.data.pop(DOMAIN, None)
+
+    shutdown_task = hass.async_create_task(instance.async_shutdown())
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(shutdown_task),
+            timeout=SETUP_CLEANUP_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        _LOGGER.warning(
+            "Timed out cleaning up %s after failed setup; cleanup continues "
+            "in the background",
+            instance.name,
+        )
+    except asyncio.CancelledError:
+        # Preserve setup cancellation. The HA-owned shutdown task keeps
+        # cleaning up independently and will be awaited by HA at stop.
+        raise
+    except Exception as err:
+        _LOGGER.debug(
+            "Error cleaning up %s after failed setup: %s",
+            instance.name,
+            err,
+        )
 
 
 async def _async_reload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> None:
