@@ -9,6 +9,8 @@ from homeassistant.components.climate.const import (
  )
 from homeassistant.const import (ATTR_TEMPERATURE, CONF_NAME, EVENT_HOMEASSISTANT_START, PRECISION_WHOLE, Platform, )
 from voluptuous import All, In
+from .source_routing import BLUETOOTH_SOURCE_AUTO
+
 DOMAIN = 'ha_tion_btle'
 DEFAULT_NAME = "Tion Breezer"
 
@@ -17,6 +19,9 @@ CONF_KEEP_ALIVE = "keep_alive"
 CONF_INITIAL_HVAC_MODE = "initial_hvac_mode"
 CONF_AWAY_TEMP = "away_temp"
 CONF_MAC = "mac"
+CONF_BLUETOOTH_SOURCE = "bluetooth_source"
+CONF_STRICT_BLUETOOTH_SOURCE = "strict_bluetooth_source"
+CONF_REPAIR = "repair"
 PLATFORMS = [Platform.SENSOR, Platform.CLIMATE, Platform.SELECT, Platform.FAN]
 SUPPORTED_DEVICES = ['S3', 'S4', 'Lite']
 

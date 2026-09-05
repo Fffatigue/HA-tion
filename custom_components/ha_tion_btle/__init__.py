@@ -20,7 +20,18 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from ._vendor import tion_btle
 from ._vendor.tion_btle.tion import Tion
-from .const import DOMAIN, TION_SCHEMA, CONF_KEEP_ALIVE, CONF_AWAY_TEMP, CONF_MAC, PLATFORMS
+from .const import (
+    BLUETOOTH_SOURCE_AUTO,
+    CONF_AWAY_TEMP,
+    CONF_BLUETOOTH_SOURCE,
+    CONF_KEEP_ALIVE,
+    CONF_MAC,
+    CONF_STRICT_BLUETOOTH_SOURCE,
+    DOMAIN,
+    PLATFORMS,
+    TION_SCHEMA,
+)
+from .source_routing import order_connection_candidates
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -341,14 +352,19 @@ class TionInstance(DataUpdateCoordinator):
                     self.rssi,
                 )
 
-        return sorted(
-            by_source.values(),
-            key=lambda candidate: (
-                candidate[1] == preferred_source,
-                candidate[2],
-            ),
-            reverse=True,
+        candidates = order_connection_candidates(
+            list(by_source.values()),
+            preferred_source,
+            self.bluetooth_source,
+            self.strict_bluetooth_source,
         )
+        if self.strict_bluetooth_source and not candidates:
+            _LOGGER.debug(
+                "Strict Bluetooth source %s is not currently seeing %s",
+                self.bluetooth_source,
+                address,
+            )
+        return candidates
 
     async def _async_connect_candidate(
         self,
@@ -389,7 +405,8 @@ class TionInstance(DataUpdateCoordinator):
             )
 
         if (
-            self._failed_connection_source is not None
+            not self.strict_bluetooth_source
+            and self._failed_connection_source is not None
             and self._failed_connection_at is not None
             and monotonic() - self._failed_connection_at
             < ALTERNATE_SOURCE_COOLDOWN_SECONDS
@@ -437,6 +454,19 @@ class TionInstance(DataUpdateCoordinator):
     def away_temp(self) -> int:
         """Temperature for away mode"""
         return self.config[CONF_AWAY_TEMP] if CONF_AWAY_TEMP in self.config else TION_SCHEMA[CONF_AWAY_TEMP]['default']
+
+    @property
+    def bluetooth_source(self) -> str:
+        """Return the configured Home Assistant Bluetooth scanner source."""
+        return str(self.config.get(CONF_BLUETOOTH_SOURCE, BLUETOOTH_SOURCE_AUTO))
+
+    @property
+    def strict_bluetooth_source(self) -> bool:
+        """Return whether connections must stay on the configured source."""
+        return bool(
+            self.config.get(CONF_STRICT_BLUETOOTH_SOURCE, False)
+            and self.bluetooth_source != BLUETOOTH_SOURCE_AUTO
+        )
 
     async def set(self, **kwargs):
         if "fan_speed" in kwargs:
@@ -518,5 +548,13 @@ class TionInstance(DataUpdateCoordinator):
             _change: bluetooth.BluetoothChange
     ) -> None:
         if service_info.device is not None:
+            source = getattr(service_info, "source", None)
+            if source is None:
+                source = self._device_source(service_info.device)
+            if (
+                self.strict_bluetooth_source
+                and str(source) != self.bluetooth_source
+            ):
+                return
             self.rssi = service_info.rssi
             self.__tion.update_btle_device(service_info.device)

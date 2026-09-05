@@ -37,6 +37,21 @@ of your Tion S3/S4/Lite breezer via bluetooth. If you are prefer control breezer
   
   Repeat this steps for every device that you are going to use with home assistant.
 
+### Bluetooth source routing and pairing
+
+By default the integration lets Home Assistant choose any Bluetooth adapter or
+ESPHome proxy that currently sees the breezer. If the breezer is bonded to only
+one adapter, open the integration entry's **Configure** dialog and select that
+adapter or proxy under **Preferred Bluetooth adapter or proxy**.
+
+Enable **Use only the preferred Bluetooth source** to prevent connection
+attempts through other, unpaired adapters. To create or replace the bond, also
+enable **Pair the selected Bluetooth source with the breezer**, submit the form,
+put the breezer into pairing mode, and immediately continue. During this
+one-shot action the running Tion connection is stopped and pairing is attempted
+only through the selected source. If pairing fails, the previous entry is
+started again without changing its routing settings.
+
 ## Usage 
 ### Turning on / Turning off
 * calling `climate.set_hvac_mode`. Mode:

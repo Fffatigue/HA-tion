@@ -34,10 +34,31 @@
         "data": {
           "name": "Name for device",
           "away_temp": "Temperature (celsius) for AWAY mode",
-          "keep_alive": "Interval for querying breezer"
+          "keep_alive": "Interval for querying breezer",
+          "bluetooth_source": "Preferred Bluetooth adapter or proxy",
+          "strict_bluetooth_source": "Use only the preferred Bluetooth source",
+          "repair": "Pair the selected Bluetooth source with the breezer"
         }
+      },
+      "pair": {
+        "title": "Pair selected Bluetooth source",
+        "description": "The current Tion connection will be stopped before pairing. Put the breezer into pairing mode, then submit immediately. Pairing will use only the Bluetooth source selected on the previous screen."
+      },
+      "pair_failed": {
+        "title": "Could not pair selected Bluetooth source",
+        "description": "The pairing attempt failed and the existing Tion entry was restored. Check the Home Assistant logs, move the proxy closer to the breezer, and try again."
       }
+    },
+    "error": {
+      "pair_source_required": "Select a specific Bluetooth source before pairing.",
+      "unload_failed": "The current Tion connection could not be stopped safely. Try again after its current update finishes."
+    },
+    "abort": {
+      "pair_successful": "Bluetooth pairing completed. The Tion entry has been pinned to the selected source and started again."
     }
+  },
+  "abort": {
+    "pair_successful": "Bluetooth pairing completed. The Tion entry has been pinned to the selected source and started again."
   }
 
 }
